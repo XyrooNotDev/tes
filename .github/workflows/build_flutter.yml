@@ -3,14 +3,6 @@ name: Build Flutter APK
 on:
   workflow_dispatch:
     inputs:
-      zip_url:
-        description: "URL download ZIP project (dari Santanic Build)"
-        required: true
-        type: string
-      tag:
-        description: "Tag build"
-        required: true
-        type: string
       build_type:
         description: "Mode build"
         required: true
@@ -25,12 +17,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Download ZIP
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Delay (untuk tracking)
+        run: sleep 15
+
+      - name: Extract project.zip
         shell: bash
         run: |
-          curl -fL --retry 3 -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
-            "${{ inputs.zip_url }}" -o project.zip
-          test -s project.zip
+          if [ ! -f project.zip ]; then
+            echo "::error::project.zip tidak ditemukan di root repository"
+            exit 1
+          fi
           unzip -q project.zip -d project_raw
 
       - name: Detect Project Root
@@ -38,7 +37,7 @@ jobs:
         run: |
           PUBSPEC=$(find project_raw -type f -name "pubspec.yaml" -print -quit)
           if [ -z "$PUBSPEC" ]; then
-            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP"
+            echo "::error::pubspec.yaml tidak ditemukan"
             exit 1
           fi
           echo "PROJECT_DIR=$(dirname "$PUBSPEC")" >> "$GITHUB_ENV"
@@ -67,16 +66,47 @@ jobs:
             flutter build apk --release
           fi
 
-      - name: Find APK
+      - name: Find and sign APK
         shell: bash
         run: |
-          APK=$(find "$GITHUB_WORKSPACE" -name "*.apk" -type f | head -1)
-          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
-          echo "APK_NAME=$(basename "$APK")" >> "$GITHUB_ENV"
+          set -e
+          mapfile -t APKS < <(find "$GITHUB_WORKSPACE/project_raw" -type f -name "*.apk" -not -iname "*androidTest*" | sort)
+          if [ ${#APKS[@]} -eq 0 ]; then
+            echo "::error::APK tidak ditemukan. Periksa log langkah Build APK."
+            exit 1
+          fi
+          APK=""
+          for f in "${APKS[@]}"; do
+            case "$f" in
+              *unsigned*) ;;
+              *) APK="$f"; break ;;
+            esac
+          done
+          if [ -z "$APK" ]; then APK="${APKS[0]}"; fi
+          echo "APK dipilih: $APK"
+
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          if ! "$BT/apksigner" verify "$APK" >/dev/null 2>&1; then
+            echo "APK belum ditandatangani -> tanda tangani dengan debug key supaya bisa diinstal"
+            keytool -genkeypair -keystore "$RUNNER_TEMP/debug.keystore" \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            "$BT/zipalign" -f -p 4 "$APK" "$RUNNER_TEMP/aligned.apk"
+            "$BT/apksigner" sign --ks "$RUNNER_TEMP/debug.keystore" \
+              --ks-pass pass:android --key-pass pass:android \
+              --out "$RUNNER_TEMP/signed.apk" "$RUNNER_TEMP/aligned.apk"
+            APK="$RUNNER_TEMP/signed.apk"
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/santanic-output"
+          cp "$APK" "$GITHUB_WORKSPACE/santanic-output/app-${{ inputs.build_type }}.apk"
+          ls -lh "$GITHUB_WORKSPACE/santanic-output"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: flutter-${{ inputs.build_type }}-${{ inputs.tag }}
-          path: ${{ env.APK_PATH }}
-          retention-days: 1
+          name: flutter-${{ inputs.build_type }}
+          path: santanic-output/*.apk
+          if-no-files-found: error
+          retention-days: 3
