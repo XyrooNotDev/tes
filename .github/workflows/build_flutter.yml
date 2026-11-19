@@ -59,11 +59,22 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          flutter pub get
+          retry() {
+            n=1
+            until "$@"; do
+              if [ "$n" -ge 3 ]; then return 1; fi
+              echo "::warning::Percobaan $n gagal (mungkin 429 dari Maven Central), mengulang dalam $((n*30)) detik..."
+              sleep $((n*30)); n=$((n+1))
+            done
+          }
+          mkdir -p "$HOME/.gradle/init.d"
+          if [ -f android/santanic-mirror.init.gradle ]; then cp android/santanic-mirror.init.gradle "$HOME/.gradle/init.d/"; fi
+          if [ -f santanic-mirror.init.gradle ]; then cp santanic-mirror.init.gradle "$HOME/.gradle/init.d/"; fi
+          retry flutter pub get
           if [ "${{ inputs.build_type }}" = "debug" ]; then
-            flutter build apk --debug
+            retry flutter build apk --debug
           else
-            flutter build apk --release
+            retry flutter build apk --release
           fi
 
       - name: Find and sign APK
