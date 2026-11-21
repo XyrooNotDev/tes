@@ -1,0 +1,309 @@
+name: Analyzer Project
+
+on:
+  workflow_dispatch:
+    inputs:
+      deep:
+        description: "Analisis mendalam (build debug penuh)"
+        required: true
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Delay (untuk tracking)
+        run: sleep 10
+
+      - name: Extract project.zip
+        shell: bash
+        run: |
+          if [ ! -f project.zip ]; then
+            echo "::error::project.zip tidak ditemukan di root repository"
+            exit 1
+          fi
+          unzip -q project.zip -d project_raw
+
+      - name: Detect project
+        shell: bash
+        run: |
+          shallow() {
+            find project_raw -type f -name "$1" \
+              -not -path '*/.dart_tool/*' -not -path '*/node_modules/*' -not -path '*/build/*' \
+              | awk -F/ '{print NF, $0}' | sort -n | head -1 | cut -d' ' -f2-
+          }
+          PUB=$(shallow pubspec.yaml)
+          if [ -n "$PUB" ]; then
+            KIND=flutter
+            DIR=$(dirname "$PUB")
+          else
+            GR=$(shallow gradlew)
+            if [ -n "$GR" ]; then
+              KIND=android
+              DIR=$(dirname "$GR")
+            else
+              KIND=unknown
+              DIR=project_raw
+            fi
+          fi
+          echo "Jenis project: $KIND ($DIR)"
+          echo "KIND=$KIND" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        if: env.KIND == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.9"
+          channel: stable
+          cache: true
+
+      - name: Setup Android SDK
+        if: env.KIND == 'android'
+        uses: android-actions/setup-android@v3
+
+      - name: Run analysis
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          DEEP: ${{ inputs.deep }}
+        run: |
+          set +e
+          A="$GITHUB_WORKSPACE/analysis"
+          mkdir -p "$A"
+          : > "$A/codes.txt"
+          mkdir -p "$HOME/.gradle/init.d"
+          if [ -f android/santanic-mirror.init.gradle ]; then cp android/santanic-mirror.init.gradle "$HOME/.gradle/init.d/"; fi
+          if [ -f santanic-mirror.init.gradle ]; then cp santanic-mirror.init.gradle "$HOME/.gradle/init.d/"; fi
+
+          if [ "$KIND" = "flutter" ]; then
+            flutter pub get > "$A/pub_get.log" 2>&1
+            PG=$?
+            echo "pub_get=$PG" >> "$A/codes.txt"
+            if [ "$PG" -eq 0 ]; then
+              flutter analyze --no-pub > "$A/analyze.log" 2>&1
+              echo "analyze=$?" >> "$A/codes.txt"
+              if [ "$DEEP" = "true" ]; then
+                flutter build apk --debug > "$A/build.log" 2>&1
+                echo "build=$?" >> "$A/codes.txt"
+              fi
+            fi
+          elif [ "$KIND" = "android" ]; then
+            chmod +x gradlew
+            ./gradlew --no-daemon --console=plain --continue compileDebugJavaWithJavac > "$A/gradle.log" 2>&1
+            echo "gradle=$?" >> "$A/codes.txt"
+            if [ "$DEEP" = "true" ]; then
+              ./gradlew --no-daemon --console=plain --continue assembleDebug > "$A/build.log" 2>&1
+              echo "build=$?" >> "$A/codes.txt"
+            fi
+          fi
+          exit 0
+
+      - name: Build report
+        if: always()
+        shell: bash
+        env:
+          DEEP: ${{ inputs.deep }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+
+          WS = os.environ["GITHUB_WORKSPACE"]
+          A = os.path.join(WS, "analysis")
+          KIND = os.environ.get("KIND", "unknown")
+          PROJECT_DIR = os.environ.get("PROJECT_DIR", "project_raw")
+          DEEP = os.environ.get("DEEP") == "true"
+          os.makedirs(A, exist_ok=True)
+          ROOT = os.path.abspath(os.path.join(WS, PROJECT_DIR))
+
+
+          def read(name):
+              p = os.path.join(A, name)
+              return open(p, errors="replace").read() if os.path.exists(p) else ""
+
+
+          codes = {}
+          for line in read("codes.txt").splitlines():
+              if "=" in line:
+                  k, v = line.split("=", 1)
+                  try:
+                      codes[k.strip()] = int(v)
+                  except ValueError:
+                      pass
+
+          findings = []
+          steps = []
+
+
+          def add(sev, title, detail="", file=None, line=None):
+              if len(findings) < 300:
+                  findings.append({"sev": sev, "title": title[:200], "detail": detail[:1500],
+                                   "file": file, "line": line})
+
+
+          def rel(path):
+              path = path.replace("file://", "")
+              if os.path.isabs(path):
+                  ap = os.path.abspath(path)
+                  if ap.startswith(ROOT + os.sep):
+                      return os.path.relpath(ap, ROOT)
+              return path
+
+
+          def step(name, ok):
+              steps.append({"name": name, "ok": bool(ok)})
+
+
+          # ---- flutter pub get ----
+          if "pub_get" in codes:
+              if codes["pub_get"] != 0:
+                  lines = read("pub_get.log").splitlines()
+                  start = 0
+                  for i, ln in enumerate(lines):
+                      if "Because" in ln or "version solving failed" in ln or ln.startswith("Error") or "Could not" in ln:
+                          start = i
+                          break
+                  add("error", "flutter pub get gagal (dependency)", "\n".join(lines[start:start + 25]))
+                  step("flutter pub get", False)
+              else:
+                  step("flutter pub get", True)
+
+          # ---- flutter analyze ----
+          if "analyze" in codes:
+              rx = re.compile(r"^\s*(error|warning|info)\s+[•\-]\s+(.*?)\s+[•\-]\s+(\S+?):(\d+):(\d+)\s+[•\-]\s+(\S+)\s*$")
+              errors = 0
+              for ln in read("analyze.log").splitlines():
+                  m = rx.match(ln)
+                  if m:
+                      sev, msg, f, l, c, rule = m.groups()
+                      if sev == "error":
+                          errors += 1
+                      add(sev, msg, "Aturan: " + rule, rel(f), int(l))
+              step("flutter analyze", errors == 0)
+
+          # ---- gradle / build ----
+          K1 = re.compile(r"^([ew]):\s+(?:file://)?(\S+?):(\d+):(\d+)\s*:?\s*(.*)$")
+          K2 = re.compile(r"^([ew]):\s+(?:file://)?(.+?):\s*\((\d+),\s*(\d+)\):\s*(.*)$")
+          J1 = re.compile(r"^\s*(\S+\.java):(\d+):\s+error:\s+(.*)$")
+
+
+          def parse_gradle(logname, codekey, label):
+              if codekey not in codes:
+                  return
+              lines = read(logname).splitlines()
+              found = 0
+              seen = set()
+              warns = 0
+              for i, ln in enumerate(lines):
+                  m = K2.match(ln) or K1.match(ln)
+                  if m:
+                      kind, f, l, c, msg = m.groups()
+                      key = (f, l, msg)
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      if kind == "e":
+                          found += 1
+                          add("error", msg or "Kesalahan kompilasi Kotlin", "", rel(f), int(l))
+                      elif warns < 30:
+                          warns += 1
+                          add("warning", msg, "", rel(f), int(l))
+                      continue
+                  j = J1.match(ln)
+                  if j:
+                      f, l, msg = j.groups()
+                      key = (f, l, msg)
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      found += 1
+                      detail = "\n".join(x.strip() for x in lines[i + 1:i + 3])
+                      add("error", msg, detail, rel(f), int(l))
+              if codes[codekey] != 0 and found == 0:
+                  summary = ""
+                  for i, ln in enumerate(lines):
+                      if ln.startswith("* What went wrong:"):
+                          block = []
+                          for x in lines[i + 1:i + 14]:
+                              if x.startswith("* Try:") or x.startswith("> Run with"):
+                                  break
+                              block.append(x)
+                          summary = "\n".join(b for b in block if b.strip())
+                          break
+                  if not summary:
+                      summary = "\n".join(lines[-20:])
+                  add("error", label + " gagal", summary)
+              step(label, codes[codekey] == 0)
+
+
+          parse_gradle("gradle.log", "gradle", "Gradle compileDebug")
+          parse_gradle("build.log", "build", "Build debug penuh")
+
+          # ---- pemeriksaan lain: rahasia tertanam & file besar ----
+          SECRETS = [
+              ("GitHub token", re.compile(r"ghp_[A-Za-z0-9]{36}")),
+              ("GitHub PAT", re.compile(r"github_pat_[A-Za-z0-9_]{50,}")),
+              ("AWS access key", re.compile(r"AKIA[0-9A-Z]{16}")),
+              ("Google API key", re.compile(r"AIza[0-9A-Za-z_\-]{35}")),
+              ("Private key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
+          ]
+          SKIP = {".git", "build", "node_modules", ".dart_tool", ".gradle", ".idea"}
+          flagged = 0
+          for dp, dns, fns in os.walk(ROOT):
+              dns[:] = [d for d in dns if d not in SKIP]
+              for fn in fns:
+                  fp = os.path.join(dp, fn)
+                  try:
+                      size = os.path.getsize(fp)
+                  except OSError:
+                      continue
+                  if size > 50 * 1024 * 1024:
+                      add("warning", "File sangat besar (" + str(size // (1024 * 1024)) + " MB)",
+                          "File besar memperlambat upload dan build.", os.path.relpath(fp, ROOT))
+                      continue
+                  if size > 2 * 1024 * 1024 or flagged >= 20:
+                      continue
+                  try:
+                      data = open(fp, "rb").read().decode("latin-1")
+                  except OSError:
+                      continue
+                  for label, rx in SECRETS:
+                      if rx.search(data):
+                          flagged += 1
+                          add("warning", "Kemungkinan rahasia tertanam: " + label,
+                              "Jangan simpan kredensial di source code. Pindahkan ke variabel/secret.",
+                              os.path.relpath(fp, ROOT))
+                          break
+
+          if KIND == "unknown":
+              add("error", "Jenis project tidak dikenali",
+                  "Tidak ada pubspec.yaml (Flutter) atau gradlew (Android Studio) di dalam ZIP.")
+
+          report = {"kind": KIND, "deep": DEEP, "steps": steps, "findings": findings}
+          with open(os.path.join(A, "analysis-report.json"), "w", encoding="utf-8") as fh:
+              json.dump(report, fh, ensure_ascii=False)
+          print("Temuan:", len(findings), "| langkah:", steps)
+          PY
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analyzer-report
+          path: analysis/
+          if-no-files-found: warn
+          retention-days: 1
