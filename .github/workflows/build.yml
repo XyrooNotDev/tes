@@ -1,0 +1,192 @@
+name: Santanic Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_zip:
+        description: "Nama ZIP project yang diupload dari aplikasi"
+        required: false
+        default: "source.zip"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Extract uploaded project ZIP
+        shell: bash
+        run: |
+          ZIP_NAME="${{ inputs.source_zip }}"
+          test -f "$ZIP_NAME" || { echo "::error::File $ZIP_NAME tidak ditemukan."; exit 1; }
+          mkdir -p _santanic_source
+          unzip -q "$ZIP_NAME" -d _santanic_source
+          PROJECT_ROOT="$(find _santanic_source -name pubspec.yaml -printf '%h\n' | head -n 1)"
+          if [ -z "$PROJECT_ROOT" ]; then
+            PROJECT_ROOT="$(find _santanic_source -name gradlew -printf '%h\n' | head -n 1)"
+          fi
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "::error::ZIP tidak berisi pubspec.yaml atau gradlew"
+            exit 1
+          fi
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "Sumber project ditemukan: $PROJECT_ROOT"
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Copy project into workspace
+        shell: bash
+        run: |
+          cp -a "$PROJECT_ROOT"/. .
+          echo "Files copied from uploaded ZIP"
+
+      - name: Restore signing keystore
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::Secret KEYSTORE_BASE64 kosong. Menggunakan debug keystore (SHA-1 akan berubah)."
+            exit 0
+          fi
+          mkdir -p "$HOME/.santanic-keys"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$HOME/.santanic-keys/santanic-release.jks"
+          echo "KEYSTORE_PATH=$HOME/.santanic-keys/santanic-release.jks" >> "$GITHUB_ENV"
+          echo "Keystore restored."
+
+      - name: Configure release signing
+        if: hashFiles('pubspec.yaml') != '' && env.KEYSTORE_PATH != ''
+        shell: bash
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ ! -f android/app/build.gradle ]; then
+            echo "::warning::build.gradle tidak ditemukan, skip."
+            exit 0
+          fi
+          cat > android/key.properties <<EOF
+          storePassword=${KEYSTORE_PASSWORD}
+          keyPassword=${KEY_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          storeFile=${KEYSTORE_PATH}
+          EOF
+          
+          # Patch build.gradle menggunakan sed (Aman dari error YAML)
+          sed -i "/apply plugin: 'com.android.application'/a \\
+          def keystoreProperties = new Properties()\\n\\
+          def keystorePropertiesFile = rootProject.file('key.properties')\\n\\
+          if (keystorePropertiesFile.exists()) {\\n\\
+              keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\\n\\
+          }" android/app/build.gradle
+          
+          # Tambah signingConfigs
+          sed -i "/android {/a \\
+              signingConfigs {\\n\\
+                  release {\\n\\
+                      keyAlias keystoreProperties['keyAlias']\\n\\
+                      keyPassword keystoreProperties['keyPassword']\\n\\
+                      storeFile file(keystoreProperties['storeFile'])\\n\\
+                      storePassword keystoreProperties['storePassword']\\n\\
+                  }\\n\\
+              }" android/app/build.gradle
+              
+          # Ubah buildTypes release untuk pakai signingConfig
+          sed -i "/release {/a \\
+                      signingConfig signingConfigs.release" android/app/build.gradle
+          echo "Signing config berhasil disuntikkan."
+
+      - name: Build Flutter APK
+        if: hashFiles('pubspec.yaml') != ''
+        run: |
+          flutter --version
+          retry() { n=1; until "$@"; do [ "$n" -ge 3 ] && return 1; echo "::warning::Percobaan $n gagal..."; sleep $((n*30)); n=$((n+1)); done; }
+          mkdir -p "$HOME/.gradle/init.d"; [ -f android/santanic-mirror.init.gradle ] && cp android/santanic-mirror.init.gradle "$HOME/.gradle/init.d/" || true
+          retry flutter pub get
+          retry flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 --split-debug-info=build/symbols || {
+            echo "::warning::Build split-per-abi gagal, mencoba build biasa"
+            flutter build apk --release --split-debug-info=build/symbols
+          }
+
+      - name: Build Android Studio APK
+        if: hashFiles('pubspec.yaml') == '' && hashFiles('gradlew') != ''
+        shell: bash
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          chmod +x ./gradlew
+          if [ -n "$KEYSTORE_PATH" ]; then
+            cat > key.properties <<EOF
+          storePassword=${KEYSTORE_PASSWORD}
+          keyPassword=${KEY_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          storeFile=${KEYSTORE_PATH}
+          EOF
+          fi
+          ./gradlew assembleRelease --stacktrace
+
+      - name: Print SHA-1 & SHA-256 fingerprint
+        shell: bash
+        run: |
+          echo "=================================================="
+          echo "     SIGNING KEY FINGERPRINT"
+          echo "=================================================="
+          if [ -n "$KEYSTORE_PATH" ]; then
+            keytool -list -v -keystore "$KEYSTORE_PATH" -alias "${{ secrets.KEY_ALIAS }}" -storepass "${{ secrets.KEYSTORE_PASSWORD }}" | tee /tmp/fingerprint.txt
+            SHA1=$(grep "SHA1:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA1: //')
+            SHA256=$(grep "SHA256:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA256: //')
+            echo "::notice title=SHA-1::$SHA1"
+            echo "::notice title=SHA-256::$SHA256"
+            mkdir -p santanic-output
+            echo "SHA1=$SHA1" >> santanic-output/fingerprint.txt
+            echo "SHA256=$SHA256" >> santanic-output/fingerprint.txt
+          else
+            echo "::warning::Menggunakan Debug Keystore (SHA-1 tidak persisten)."
+            keytool -list -v -keystore "$HOME/.android/debug.keystore" -alias androiddebugkey -storepass android -keypass android | tee /tmp/fingerprint.txt
+          fi
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          mkdir -p santanic-output
+          find . -type f -name '*.apk' -path '*/outputs/*' -not -path './santanic-output/*' -exec cp {} santanic-output/ \;
+          if [ -z "$(find santanic-output -name '*.apk' -print -quit)" ]; then
+            echo "::error::APK tidak ditemukan."
+            exit 1
+          fi
+          ls -lh santanic-output
+          for f in santanic-output/*.apk; do
+            SIZE=$(stat -c%s "$f")
+            echo "$(basename "$f"): $((SIZE / 1024 / 1024)) MB"
+          done
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Santanic-APK
+          path: |
+            santanic-output/*.apk
+            santanic-output/fingerprint.txt
+          if-no-files-found: error
+          retention-days: 90
