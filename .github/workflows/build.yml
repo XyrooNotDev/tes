@@ -40,17 +40,93 @@ jobs:
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
           echo "Sumber project ditemukan: $PROJECT_ROOT"
 
-      - name: Install Java
-        uses: actions/setup-java@v4
+      - name: Install Java 17
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
+
+      # =============================================================
+      # CACHE GRADLE — supaya dependency tidak didownload ulang
+      # =============================================================
+      - name: Cache Gradle
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.gradle/init.d
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
 
       - name: Prepare Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
+
+      # =============================================================
+      # MIRROR MAVEN — hindari 429 dari Maven Central
+      # =============================================================
+      - name: Install Gradle Maven mirror (anti 429)
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/00-santanic-mirror.gradle" <<'GRADLE_EOF'
+          // Mirror Maven Central -> Google Storage + Aliyun
+          // Dipakai untuk menghindari 429 Too Many Requests dari repo.maven.apache.org
+          def mirrors = [
+              'https://maven-central.storage-download.googleapis.com/maven2/',
+              'https://maven.aliyun.com/repository/central',
+              'https://maven.aliyun.com/repository/gradle-plugin',
+              'https://maven.aliyun.com/repository/public',
+          ]
+
+          def applyMirror = { repositories ->
+              mirrors.each { u -> repositories.maven { url u } }
+              repositories.all { repo ->
+                  if (repo instanceof org.gradle.api.artifacts.repositories.MavenArtifactRepository) {
+                      def u = repo.url.toString()
+                      if (u.contains('repo.maven.apache.org') || u.contains('repo1.maven.org')) {
+                          // jangan disable total: biarkan sebagai fallback terakhir
+                          // tapi prioritas lebih rendah sudah otomatis karena mirrors ditambahkan dulu
+                      }
+                  }
+              }
+          }
+
+          beforeSettings { settings ->
+              settings.pluginManagement.repositories { applyMirror(delegate) }
+              settings.dependencyResolutionManagement.repositories { applyMirror(delegate) }
+          }
+
+          allprojects { proj ->
+              proj.buildscript.repositories { applyMirror(delegate) }
+              proj.repositories { applyMirror(delegate) }
+          }
+          GRADLE_EOF
+          echo "Mirror Gradle terpasang di:"
+          ls -la "$HOME/.gradle/init.d/"
+
+      # =============================================================
+      # RETRY CONFIG — biar Gradle otomatis retry saat kena 429
+      # =============================================================
+      - name: Configure Gradle retry & timeout
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gradle"
+          cat >> "$HOME/.gradle/gradle.properties" <<'EOF'
+          org.gradle.internal.http.connectionTimeout=120000
+          org.gradle.internal.http.socketTimeout=120000
+          systemProp.org.gradle.internal.repository.max.retries=5
+          systemProp.org.gradle.internal.repository.initial.backoff=2000
+          systemProp.org.gradle.internal.repository.max.backoff=60000
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          org.gradle.daemon=false
+          EOF
+          echo "Gradle retry config terpasang."
 
       - name: Copy project into workspace
         shell: bash
@@ -90,16 +166,14 @@ jobs:
           keyAlias=${KEY_ALIAS}
           storeFile=${KEYSTORE_PATH}
           EOF
-          
-          # Patch build.gradle menggunakan sed (Aman dari error YAML)
+
           sed -i "/apply plugin: 'com.android.application'/a \\
           def keystoreProperties = new Properties()\\n\\
           def keystorePropertiesFile = rootProject.file('key.properties')\\n\\
           if (keystorePropertiesFile.exists()) {\\n\\
               keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\\n\\
           }" android/app/build.gradle
-          
-          # Tambah signingConfigs
+
           sed -i "/android {/a \\
               signingConfigs {\\n\\
                   release {\\n\\
@@ -109,23 +183,38 @@ jobs:
                       storePassword keystoreProperties['storePassword']\\n\\
                   }\\n\\
               }" android/app/build.gradle
-              
-          # Ubah buildTypes release untuk pakai signingConfig
+
           sed -i "/release {/a \\
                       signingConfig signingConfigs.release" android/app/build.gradle
           echo "Signing config berhasil disuntikkan."
 
+      # =============================================================
+      # BUILD FLUTTER — retry 5x dengan backoff + fallback tanpa split
+      # =============================================================
       - name: Build Flutter APK
         if: hashFiles('pubspec.yaml') != ''
+        shell: bash
         run: |
           flutter --version
-          retry() { n=1; until "$@"; do [ "$n" -ge 3 ] && return 1; echo "::warning::Percobaan $n gagal..."; sleep $((n*30)); n=$((n+1)); done; }
-          mkdir -p "$HOME/.gradle/init.d"; [ -f android/santanic-mirror.init.gradle ] && cp android/santanic-mirror.init.gradle "$HOME/.gradle/init.d/" || true
-          retry flutter pub get
-          retry flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 --split-debug-info=build/symbols || {
-            echo "::warning::Build split-per-abi gagal, mencoba build biasa"
-            flutter build apk --release --split-debug-info=build/symbols
+
+          retry() {
+            n=1
+            until "$@"; do
+              if [ "$n" -ge 5 ]; then return 1; fi
+              echo "::warning::Percobaan $n gagal, mengulang dalam $((n*30)) detik..."
+              sleep $((n*30))
+              n=$((n+1))
+            done
           }
+
+          retry flutter pub get
+
+          if retry flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 --split-debug-info=build/symbols; then
+            echo "✅ Build split-per-abi berhasil."
+          else
+            echo "::warning::Build split-per-abi gagal, mencoba build biasa (tanpa split)."
+            retry flutter build apk --release --split-debug-info=build/symbols
+          fi
 
       - name: Build Android Studio APK
         if: hashFiles('pubspec.yaml') == '' && hashFiles('gradlew') != ''
