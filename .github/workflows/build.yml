@@ -8,9 +8,14 @@ on:
         required: false
         default: "source.zip"
         type: string
+      require_signing:
+        description: "Wajibkan release keystore (gagal kalau secret kosong)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: read
+  contents: write
   actions: read
 
 jobs:
@@ -18,9 +23,15 @@ jobs:
     name: Build Android APK
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
+    env:
+      REQUIRE_RELEASE_SIGNING: ${{ inputs.require_signing }}
+
     steps:
       - name: Checkout workflow repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Extract uploaded project ZIP
         shell: bash
@@ -46,9 +57,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # =============================================================
-      # CACHE GRADLE — supaya dependency tidak didownload ulang
-      # =============================================================
       - name: Cache Gradle
         uses: actions/cache@v5
         with:
@@ -67,15 +75,19 @@ jobs:
           cache: true
 
       # =============================================================
-      # MIRROR MAVEN — hindari 429 dari Maven Central
+      # MIRROR — versi aman untuk Gradle 8+ / Flutter 3.50.1
       # =============================================================
-      - name: Install Gradle Maven mirror (anti 429)
+      - name: Install Gradle Maven mirror (anti 429, Gradle 8+ safe)
         shell: bash
         run: |
           mkdir -p "$HOME/.gradle/init.d"
           cat > "$HOME/.gradle/init.d/00-santanic-mirror.gradle" <<'GRADLE_EOF'
-          // Mirror Maven Central -> Google Storage + Aliyun
-          // Dipakai untuk menghindari 429 Too Many Requests dari repo.maven.apache.org
+          // Mirror Maven Central -> Google Storage + Aliyun.
+          // Aturan penting: JANGAN tambah repo di project-level saat
+          // repositoriesMode = FAIL_ON_PROJECT_REPOS (default Flutter 3.50.1).
+          // Yang aman hanya: pluginManagement, dependencyResolutionManagement,
+          // dan buildscript.repositories (dikecualikan dari aturan tsb).
+
           def mirrors = [
               'https://maven-central.storage-download.googleapis.com/maven2/',
               'https://maven.aliyun.com/repository/central',
@@ -83,35 +95,46 @@ jobs:
               'https://maven.aliyun.com/repository/public',
           ]
 
-          def applyMirror = { repositories ->
-              mirrors.each { u -> repositories.maven { url u } }
-              repositories.all { repo ->
-                  if (repo instanceof org.gradle.api.artifacts.repositories.MavenArtifactRepository) {
-                      def u = repo.url.toString()
-                      if (u.contains('repo.maven.apache.org') || u.contains('repo1.maven.org')) {
-                          // jangan disable total: biarkan sebagai fallback terakhir
-                          // tapi prioritas lebih rendah sudah otomatis karena mirrors ditambahkan dulu
-                      }
+          beforeSettings { settings ->
+              // Longgarkan mode agar project boleh punya repo sendiri (kalau memang perlu).
+              // PREFER_SETTINGS tetap memprioritaskan repo dari settings (mirror kita).
+              try {
+                  settings.dependencyResolutionManagement.repositoriesMode.set(
+                      org.gradle.api.initialization.resolve.RepositoriesMode.PREFER_SETTINGS
+                  )
+              } catch (Throwable ignored) { /* Gradle lama tidak punya API ini */ }
+
+              // 1) Plugin management (flutter-plugin-loader, AGP, Kotlin DSL, dll.)
+              try {
+                  settings.pluginManagement.repositories { repos ->
+                      mirrors.each { u -> repos.maven { url u } }
                   }
+              } catch (Throwable t) {
+                  println "[santanic-mirror] pluginManagement: ${t.message}"
+              }
+
+              // 2) Dependency resolution (kotlin-stdlib, androidx, dll.)
+              try {
+                  settings.dependencyResolutionManagement.repositories { repos ->
+                      mirrors.each { u -> repos.maven { url u } }
+                  }
+              } catch (Throwable t) {
+                  println "[santanic-mirror] dependencyResolutionManagement: ${t.message}"
               }
           }
 
-          beforeSettings { settings ->
-              settings.pluginManagement.repositories { applyMirror(delegate) }
-              settings.dependencyResolutionManagement.repositories { applyMirror(delegate) }
-          }
-
+          // 3) Buildscript classpath (kotlin-gradle-plugin, dll.) — aman!
           allprojects { proj ->
-              proj.buildscript.repositories { applyMirror(delegate) }
-              proj.repositories { applyMirror(delegate) }
+              try {
+                  proj.buildscript.repositories { repos ->
+                      mirrors.each { u -> repos.maven { url u } }
+                  }
+              } catch (Throwable ignored) { }
           }
           GRADLE_EOF
-          echo "Mirror Gradle terpasang di:"
+          echo "Mirror Gradle terpasang:"
           ls -la "$HOME/.gradle/init.d/"
 
-      # =============================================================
-      # RETRY CONFIG — biar Gradle otomatis retry saat kena 429
-      # =============================================================
       - name: Configure Gradle retry & timeout
         shell: bash
         run: |
@@ -134,13 +157,21 @@ jobs:
           cp -a "$PROJECT_ROOT"/. .
           echo "Files copied from uploaded ZIP"
 
+      # =============================================================
+      # RESTORE RELEASE KEYSTORE
+      # =============================================================
       - name: Restore signing keystore
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          REQUIRE_SIGNING: ${{ env.REQUIRE_RELEASE_SIGNING }}
         run: |
           if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "::warning::Secret KEYSTORE_BASE64 kosong. Menggunakan debug keystore (SHA-1 akan berubah)."
+            if [ "$REQUIRE_SIGNING" = "true" ]; then
+              echo "::error::KEYSTORE_BASE64 kosong tapi require_signing=true. Build dibatalkan."
+              exit 1
+            fi
+            echo "::warning::KEYSTORE_BASE64 kosong. Menggunakan debug keystore (SHA-1 akan BERUBAH)."
             exit 0
           fi
           mkdir -p "$HOME/.santanic-keys"
@@ -189,14 +220,13 @@ jobs:
           echo "Signing config berhasil disuntikkan."
 
       # =============================================================
-      # BUILD FLUTTER — retry 5x dengan backoff + fallback tanpa split
+      # BUILD FLUTTER — retry 5x + fallback tanpa split
       # =============================================================
       - name: Build Flutter APK
         if: hashFiles('pubspec.yaml') != ''
         shell: bash
         run: |
           flutter --version
-
           retry() {
             n=1
             until "$@"; do
@@ -206,13 +236,11 @@ jobs:
               n=$((n+1))
             done
           }
-
           retry flutter pub get
-
           if retry flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 --split-debug-info=build/symbols; then
             echo "✅ Build split-per-abi berhasil."
           else
-            echo "::warning::Build split-per-abi gagal, mencoba build biasa (tanpa split)."
+            echo "::warning::Build split-per-abi gagal, mencoba build biasa."
             retry flutter build apk --release --split-debug-info=build/symbols
           fi
 
@@ -235,26 +263,108 @@ jobs:
           fi
           ./gradlew assembleRelease --stacktrace
 
-      - name: Print SHA-1 & SHA-256 fingerprint
+      # =============================================================
+      # FINGERPRINT — print + verifikasi + simpan permanen
+      # =============================================================
+      - name: Print & verify SHA fingerprint
+        id: fp
         shell: bash
+        env:
+          EXPECTED_SHA256: ${{ secrets.EXPECTED_SHA256 }}
         run: |
           echo "=================================================="
           echo "     SIGNING KEY FINGERPRINT"
           echo "=================================================="
           if [ -n "$KEYSTORE_PATH" ]; then
-            keytool -list -v -keystore "$KEYSTORE_PATH" -alias "${{ secrets.KEY_ALIAS }}" -storepass "${{ secrets.KEYSTORE_PASSWORD }}" | tee /tmp/fingerprint.txt
-            SHA1=$(grep "SHA1:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA1: //')
-            SHA256=$(grep "SHA256:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA256: //')
-            echo "::notice title=SHA-1::$SHA1"
-            echo "::notice title=SHA-256::$SHA256"
-            mkdir -p santanic-output
-            echo "SHA1=$SHA1" >> santanic-output/fingerprint.txt
-            echo "SHA256=$SHA256" >> santanic-output/fingerprint.txt
+            keytool -list -v -keystore "$KEYSTORE_PATH" \
+              -alias "${{ secrets.KEY_ALIAS }}" \
+              -storepass "${{ secrets.KEYSTORE_PASSWORD }}" | tee /tmp/fingerprint.txt
+            SHA1=$(grep "SHA1:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA1: //' | tr -d ' ')
+            SHA256=$(grep "SHA256:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA256: //' | tr -d ' ')
+            SOURCE="release-keystore"
           else
-            echo "::warning::Menggunakan Debug Keystore (SHA-1 tidak persisten)."
-            keytool -list -v -keystore "$HOME/.android/debug.keystore" -alias androiddebugkey -storepass android -keypass android | tee /tmp/fingerprint.txt
+            echo "::warning::Menggunakan Debug Keystore (SHA tidak persisten)."
+            keytool -list -v -keystore "$HOME/.android/debug.keystore" \
+              -alias androiddebugkey -storepass android -keypass android | tee /tmp/fingerprint.txt
+            SHA1=$(grep "SHA1:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA1: //' | tr -d ' ')
+            SHA256=$(grep "SHA256:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA256: //' | tr -d ' ')
+            SOURCE="debug-keystore"
           fi
 
+          echo "::notice title=SHA-1::$SHA1"
+          echo "::notice title=SHA-256::$SHA256"
+          echo "::notice title=Source::$SOURCE"
+
+          if [ -n "$EXPECTED_SHA256" ]; then
+            EXPECTED_NORM=$(echo "$EXPECTED_SHA256" | tr '[:lower:]' '[:upper:]' | tr -d ':')
+            ACTUAL_NORM=$(echo "$SHA256" | tr '[:lower:]' '[:upper:]' | tr -d ':')
+            if [ "$EXPECTED_NORM" != "$ACTUAL_NORM" ]; then
+              echo "::error::SHA-256 TIDAK COCOK!"
+              echo "   Expected : $EXPECTED_SHA256"
+              echo "   Actual   : $SHA256"
+              echo "   Sumber   : $SOURCE"
+              exit 1
+            fi
+            echo "✅ SHA-256 cocok dengan EXPECTED_SHA256 secret."
+          else
+            echo "::warning::EXPECTED_SHA256 tidak diisi — verifikasi dilewati."
+          fi
+
+          echo "SHA1=$SHA1" >> "$GITHUB_ENV"
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
+          echo "FP_SOURCE=$SOURCE" >> "$GITHUB_ENV"
+
+          mkdir -p santanic-output
+          {
+            echo "source=$SOURCE"
+            echo "sha1=$SHA1"
+            echo "sha256=$SHA256"
+          } > santanic-output/fingerprint.txt
+
+      - name: Commit fingerprint to repo (permanen)
+        if: env.KEYSTORE_PATH != '' && env.SHA256 != ''
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p docs
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          SHA1="${{ env.SHA1 }}"
+          SHA256="${{ env.SHA256 }}"
+          SRC="${{ env.FP_SOURCE }}"
+          BUILD_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          cat > docs/fingerprint.md <<EOF
+          # Santanic App — Signing Fingerprint
+
+          Fingerprint ini **stabil permanen** selama \`KEYSTORE_BASE64\` di GitHub Secrets tidak diubah.
+
+          | Field | Nilai |
+          |---|---|
+          | **SHA-1** | \`${SHA1}\` |
+          | **SHA-256** | \`${SHA256}\` |
+          | Alias | \`${{ secrets.KEY_ALIAS }}\` |
+          | Sumber | \`${SRC}\` |
+          | Terakhir update | \`${TS}\` |
+          | Build | [lihat log](${BUILD_URL}) |
+
+          > ⚠️ Jangan mengubah isi file ini secara manual. File ini di-generate otomatis oleh workflow \`.github/workflows/build-apk.yml\`.
+          EOF
+
+          git config user.name  "Santanic Bot"
+          git config user.email "bot@santanic.local"
+          git add docs/fingerprint.md
+          if git diff --staged --quiet; then
+            echo "Tidak ada perubahan fingerprint. Skip commit."
+          else
+            git commit -m "chore(fingerprint): update signing fingerprint [skip ci]"
+            git push
+            echo "✅ docs/fingerprint.md diperbarui di repo."
+          fi
+
+      # =============================================================
+      # COLLECT & UPLOAD
+      # =============================================================
       - name: Collect APK
         shell: bash
         run: |
