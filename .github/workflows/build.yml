@@ -26,7 +26,7 @@ jobs:
 
     env:
       REQUIRE_RELEASE_SIGNING: ${{ inputs.require_signing }}
-      FLUTTER_VERSION: '3.41.9'      # ← ubah di sini kalau mau versi lain
+      FLUTTER_VERSION: '3.41.9'
 
     steps:
       - name: Checkout workflow repository
@@ -77,86 +77,81 @@ jobs:
           cache: true
 
       # =============================================================
-      # MIRROR — versi aman untuk Gradle 8+ (fix FAIL_ON_PROJECT_REPOS)
+      # MIRROR — tambal Maven Central + Google Maven untuk semua subproject
       # =============================================================
       - name: Install Gradle Maven mirror (anti 429, includes Google Maven)
-  shell: bash
-  run: |
-    mkdir -p "$HOME/.gradle/init.d"
-    cat > "$HOME/.gradle/init.d/00-santanic-mirror.gradle" <<'GRADLE_EOF'
-    // ============================================================
-    // Santanic Gradle Mirror Init Script
-    // - Menambal Maven Central AND Google Maven (androidx, flutter_embedding)
-    // - Inject ke SETIAP subproject (plugin Flutter punya repo sendiri)
-    // - Mode PREFER_PROJECT agar plugin tidak "menolak" mirror settings
-    // ============================================================
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/00-santanic-mirror.gradle" <<'GRADLE_EOF'
+          // ============================================================
+          // Santanic Gradle Mirror Init Script
+          // - Tambal Maven Central AND Google Maven (androidx, flutter_embedding)
+          // - Inject ke SETIAP subproject (plugin Flutter punya repo sendiri)
+          // - Mode PREFER_PROJECT agar plugin tidak "menolak" mirror settings
+          // ============================================================
 
-    def mirrors = [
-        // ---- Google Maven (WAJIB: flutter_embedding, androidx.*) ----
-        'https://dl.google.com/dl/android/maven2/',
-        'https://maven.google.com/',
-        'https://maven.aliyun.com/repository/google',
+          def mirrors = [
+              // ---- Google Maven (WAJIB: flutter_embedding, androidx.*) ----
+              'https://dl.google.com/dl/android/maven2/',
+              'https://maven.google.com/',
+              'https://maven.aliyun.com/repository/google',
 
-        // ---- Maven Central mirror ----
-        'https://maven-central.storage-download.googleapis.com/maven2/',
-        'https://maven.aliyun.com/repository/central',
-        'https://maven.aliyun.com/repository/gradle-plugin',
-        'https://maven.aliyun.com/repository/public',
-    ]
+              // ---- Maven Central mirror ----
+              'https://maven-central.storage-download.googleapis.com/maven2/',
+              'https://maven.aliyun.com/repository/central',
+              'https://maven.aliyun.com/repository/gradle-plugin',
+              'https://maven.aliyun.com/repository/public',
+          ]
 
-    beforeSettings { settings ->
-        // PREFER_PROJECT: plugin pihak ketiga (connectivity_plus, battery_plus, dll.)
-        // punya repositories { google(); mavenCentral() } di build.gradle-nya.
-        // Kalau kita pakai PREFER_SETTINGS, repo plugin DIABAIKAN → dependency hilang.
-        try {
-            settings.dependencyResolutionManagement.repositoriesMode.set(
-                org.gradle.api.initialization.resolve.RepositoriesMode.PREFER_PROJECT
-            )
-        } catch (Throwable ignored) { }
+          beforeSettings { settings ->
+              // PREFER_PROJECT: plugin pihak ketiga punya repo sendiri di build.gradle.
+              // Kalau PREFER_SETTINGS, repo plugin DIABAIKAN -> dependency hilang.
+              try {
+                  settings.dependencyResolutionManagement.repositoriesMode.set(
+                      org.gradle.api.initialization.resolve.RepositoriesMode.PREFER_PROJECT
+                  )
+              } catch (Throwable ignored) { }
 
-        try {
-            settings.pluginManagement.repositories { repos ->
-                mirrors.each { u -> repos.maven { url u } }
-            }
-        } catch (Throwable t) {
-            println "[santanic-mirror] pluginManagement: ${t.message}"
-        }
+              try {
+                  settings.pluginManagement.repositories { repos ->
+                      mirrors.each { u -> repos.maven { url u } }
+                  }
+              } catch (Throwable t) {
+                  println "[santanic-mirror] pluginManagement: ${t.message}"
+              }
 
-        try {
-            settings.dependencyResolutionManagement.repositories { repos ->
-                mirrors.each { u -> repos.maven { url u } }
-            }
-        } catch (Throwable t) {
-            println "[santanic-mirror] dependencyResolutionManagement: ${t.message}"
-        }
-    }
+              try {
+                  settings.dependencyResolutionManagement.repositories { repos ->
+                      mirrors.each { u -> repos.maven { url u } }
+                  }
+              } catch (Throwable t) {
+                  println "[santanic-mirror] dependencyResolutionManagement: ${t.message}"
+              }
+          }
 
-    // ============================================================
-    // INJECT MIRROR KE SETIAP SUBPROJECT
-    // (ini kunci fix untuk: Could not find flutter_embedding_release)
-    // ============================================================
-    beforeProject { proj ->
-        try {
-            proj.repositories { repos ->
-                // google() asli didahulukan
-                repos.google()
-                repos.mavenCentral()
-                mirrors.each { u -> repos.maven { url u } }
-            }
-        } catch (Throwable t) {
-            println "[santanic-mirror] beforeProject.repositories(${proj.name}): ${t.message}"
-        }
+          // Inject mirror ke SETIAP subproject (kunci fix flutter_embedding_release)
+          beforeProject { proj ->
+              try {
+                  proj.repositories { repos ->
+                      repos.google()
+                      repos.mavenCentral()
+                      mirrors.each { u -> repos.maven { url u } }
+                  }
+              } catch (Throwable t) {
+                  println "[santanic-mirror] beforeProject.repositories(${proj.name}): ${t.message}"
+              }
 
-        try {
-            proj.buildscript.repositories { repos ->
-                repos.google()
-                mirrors.each { u -> repos.maven { url u } }
-            }
-        } catch (Throwable ignored) { }
-    }
-    GRADLE_EOF
-    echo "Mirror Gradle terpasang:"
-    ls -la "$HOME/.gradle/init.d/"
+              try {
+                  proj.buildscript.repositories { repos ->
+                      repos.google()
+                      mirrors.each { u -> repos.maven { url u } }
+                  }
+              } catch (Throwable ignored) { }
+          }
+          GRADLE_EOF
+          echo "Mirror Gradle terpasang:"
+          ls -la "$HOME/.gradle/init.d/"
 
       - name: Configure Gradle retry & timeout
         shell: bash
@@ -179,11 +174,6 @@ jobs:
           cp -a "$PROJECT_ROOT"/. .
           echo "Files copied from uploaded ZIP"
 
-      # =============================================================
-      # SAFETY: kalau project minta Gradle < versi minimum Flutter,
-      # naikkan wrapper otomatis (fallback kalau FLUTTER_VERSION diubah
-      # ke 3.50+ nanti). Untuk 3.41.9 ini biasanya no-op.
-      # =============================================================
       - name: Ensure Gradle wrapper compatible with Flutter ${{ env.FLUTTER_VERSION }}
         shell: bash
         run: |
@@ -206,9 +196,6 @@ jobs:
           fi
           cat "$PROPS"
 
-      # =============================================================
-      # RESTORE RELEASE KEYSTORE
-      # =============================================================
       - name: Restore signing keystore
         shell: bash
         env:
@@ -268,9 +255,6 @@ jobs:
                       signingConfig signingConfigs.release" android/app/build.gradle
           echo "Signing config berhasil disuntikkan."
 
-      # =============================================================
-      # BUILD FLUTTER — retry 5x + fallback tanpa split
-      # =============================================================
       - name: Build Flutter APK
         if: hashFiles('pubspec.yaml') != ''
         shell: bash
@@ -312,9 +296,6 @@ jobs:
           fi
           ./gradlew assembleRelease --stacktrace
 
-      # =============================================================
-      # FINGERPRINT — print + verifikasi + simpan permanen
-      # =============================================================
       - name: Print & verify SHA fingerprint
         id: fp
         shell: bash
@@ -411,9 +392,6 @@ jobs:
             echo "✅ docs/fingerprint.md diperbarui di repo."
           fi
 
-      # =============================================================
-      # COLLECT & UPLOAD
-      # =============================================================
       - name: Collect APK
         shell: bash
         run: |
