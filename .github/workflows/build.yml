@@ -26,6 +26,7 @@ jobs:
 
     env:
       REQUIRE_RELEASE_SIGNING: ${{ inputs.require_signing }}
+      FLUTTER_VERSION: '3.41.9'      # ← ubah di sini kalau mau versi lain
 
     steps:
       - name: Checkout workflow repository
@@ -71,69 +72,91 @@ jobs:
       - name: Prepare Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
 
       # =============================================================
-      # MIRROR — versi aman untuk Gradle 8+ / Flutter 3.50.1
+      # MIRROR — versi aman untuk Gradle 8+ (fix FAIL_ON_PROJECT_REPOS)
       # =============================================================
-      - name: Install Gradle Maven mirror (anti 429, Gradle 8+ safe)
-        shell: bash
-        run: |
-          mkdir -p "$HOME/.gradle/init.d"
-          cat > "$HOME/.gradle/init.d/00-santanic-mirror.gradle" <<'GRADLE_EOF'
-          // Mirror Maven Central -> Google Storage + Aliyun.
-          // Aturan penting: JANGAN tambah repo di project-level saat
-          // repositoriesMode = FAIL_ON_PROJECT_REPOS (default Flutter 3.50.1).
-          // Yang aman hanya: pluginManagement, dependencyResolutionManagement,
-          // dan buildscript.repositories (dikecualikan dari aturan tsb).
+      - name: Install Gradle Maven mirror (anti 429, includes Google Maven)
+  shell: bash
+  run: |
+    mkdir -p "$HOME/.gradle/init.d"
+    cat > "$HOME/.gradle/init.d/00-santanic-mirror.gradle" <<'GRADLE_EOF'
+    // ============================================================
+    // Santanic Gradle Mirror Init Script
+    // - Menambal Maven Central AND Google Maven (androidx, flutter_embedding)
+    // - Inject ke SETIAP subproject (plugin Flutter punya repo sendiri)
+    // - Mode PREFER_PROJECT agar plugin tidak "menolak" mirror settings
+    // ============================================================
 
-          def mirrors = [
-              'https://maven-central.storage-download.googleapis.com/maven2/',
-              'https://maven.aliyun.com/repository/central',
-              'https://maven.aliyun.com/repository/gradle-plugin',
-              'https://maven.aliyun.com/repository/public',
-          ]
+    def mirrors = [
+        // ---- Google Maven (WAJIB: flutter_embedding, androidx.*) ----
+        'https://dl.google.com/dl/android/maven2/',
+        'https://maven.google.com/',
+        'https://maven.aliyun.com/repository/google',
 
-          beforeSettings { settings ->
-              // Longgarkan mode agar project boleh punya repo sendiri (kalau memang perlu).
-              // PREFER_SETTINGS tetap memprioritaskan repo dari settings (mirror kita).
-              try {
-                  settings.dependencyResolutionManagement.repositoriesMode.set(
-                      org.gradle.api.initialization.resolve.RepositoriesMode.PREFER_SETTINGS
-                  )
-              } catch (Throwable ignored) { /* Gradle lama tidak punya API ini */ }
+        // ---- Maven Central mirror ----
+        'https://maven-central.storage-download.googleapis.com/maven2/',
+        'https://maven.aliyun.com/repository/central',
+        'https://maven.aliyun.com/repository/gradle-plugin',
+        'https://maven.aliyun.com/repository/public',
+    ]
 
-              // 1) Plugin management (flutter-plugin-loader, AGP, Kotlin DSL, dll.)
-              try {
-                  settings.pluginManagement.repositories { repos ->
-                      mirrors.each { u -> repos.maven { url u } }
-                  }
-              } catch (Throwable t) {
-                  println "[santanic-mirror] pluginManagement: ${t.message}"
-              }
+    beforeSettings { settings ->
+        // PREFER_PROJECT: plugin pihak ketiga (connectivity_plus, battery_plus, dll.)
+        // punya repositories { google(); mavenCentral() } di build.gradle-nya.
+        // Kalau kita pakai PREFER_SETTINGS, repo plugin DIABAIKAN → dependency hilang.
+        try {
+            settings.dependencyResolutionManagement.repositoriesMode.set(
+                org.gradle.api.initialization.resolve.RepositoriesMode.PREFER_PROJECT
+            )
+        } catch (Throwable ignored) { }
 
-              // 2) Dependency resolution (kotlin-stdlib, androidx, dll.)
-              try {
-                  settings.dependencyResolutionManagement.repositories { repos ->
-                      mirrors.each { u -> repos.maven { url u } }
-                  }
-              } catch (Throwable t) {
-                  println "[santanic-mirror] dependencyResolutionManagement: ${t.message}"
-              }
-          }
+        try {
+            settings.pluginManagement.repositories { repos ->
+                mirrors.each { u -> repos.maven { url u } }
+            }
+        } catch (Throwable t) {
+            println "[santanic-mirror] pluginManagement: ${t.message}"
+        }
 
-          // 3) Buildscript classpath (kotlin-gradle-plugin, dll.) — aman!
-          allprojects { proj ->
-              try {
-                  proj.buildscript.repositories { repos ->
-                      mirrors.each { u -> repos.maven { url u } }
-                  }
-              } catch (Throwable ignored) { }
-          }
-          GRADLE_EOF
-          echo "Mirror Gradle terpasang:"
-          ls -la "$HOME/.gradle/init.d/"
+        try {
+            settings.dependencyResolutionManagement.repositories { repos ->
+                mirrors.each { u -> repos.maven { url u } }
+            }
+        } catch (Throwable t) {
+            println "[santanic-mirror] dependencyResolutionManagement: ${t.message}"
+        }
+    }
+
+    // ============================================================
+    // INJECT MIRROR KE SETIAP SUBPROJECT
+    // (ini kunci fix untuk: Could not find flutter_embedding_release)
+    // ============================================================
+    beforeProject { proj ->
+        try {
+            proj.repositories { repos ->
+                // google() asli didahulukan
+                repos.google()
+                repos.mavenCentral()
+                mirrors.each { u -> repos.maven { url u } }
+            }
+        } catch (Throwable t) {
+            println "[santanic-mirror] beforeProject.repositories(${proj.name}): ${t.message}"
+        }
+
+        try {
+            proj.buildscript.repositories { repos ->
+                repos.google()
+                mirrors.each { u -> repos.maven { url u } }
+            }
+        } catch (Throwable ignored) { }
+    }
+    GRADLE_EOF
+    echo "Mirror Gradle terpasang:"
+    ls -la "$HOME/.gradle/init.d/"
 
       - name: Configure Gradle retry & timeout
         shell: bash
@@ -149,13 +172,39 @@ jobs:
           org.gradle.caching=true
           org.gradle.daemon=false
           EOF
-          echo "Gradle retry config terpasang."
 
       - name: Copy project into workspace
         shell: bash
         run: |
           cp -a "$PROJECT_ROOT"/. .
           echo "Files copied from uploaded ZIP"
+
+      # =============================================================
+      # SAFETY: kalau project minta Gradle < versi minimum Flutter,
+      # naikkan wrapper otomatis (fallback kalau FLUTTER_VERSION diubah
+      # ke 3.50+ nanti). Untuk 3.41.9 ini biasanya no-op.
+      # =============================================================
+      - name: Ensure Gradle wrapper compatible with Flutter ${{ env.FLUTTER_VERSION }}
+        shell: bash
+        run: |
+          PROPS=android/gradle/wrapper/gradle-wrapper.properties
+          if [ ! -f "$PROPS" ]; then
+            echo "::warning::$PROPS tidak ada, skip."
+            exit 0
+          fi
+          CURRENT=$(grep -E '^distributionUrl=' "$PROPS" | sed -E 's#.*/gradle-([0-9.]+)-.*#\1#' | head -n1)
+          echo "Gradle wrapper saat ini: $CURRENT"
+          MIN="8.14"
+          if [ -z "$CURRENT" ]; then
+            echo "::warning::Tidak bisa baca versi, paksa 8.14.3"
+            sed -i -E 's#^distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.3-bin.zip#' "$PROPS"
+          elif [ "$(printf '%s\n' "$MIN" "$CURRENT" | sort -V | head -n1)" = "$CURRENT" ] && [ "$CURRENT" != "$MIN" ]; then
+            echo "→ Gradle di bawah $MIN, upgrade ke 8.14.3"
+            sed -i -E 's#^distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.3-bin.zip#' "$PROPS"
+          else
+            echo "→ Gradle OK."
+          fi
+          cat "$PROPS"
 
       # =============================================================
       # RESTORE RELEASE KEYSTORE
@@ -348,7 +397,7 @@ jobs:
           | Terakhir update | \`${TS}\` |
           | Build | [lihat log](${BUILD_URL}) |
 
-          > ⚠️ Jangan mengubah isi file ini secara manual. File ini di-generate otomatis oleh workflow \`.github/workflows/build-apk.yml\`.
+          > ⚠️ Jangan mengubah isi file ini secara manual.
           EOF
 
           git config user.name  "Santanic Bot"
