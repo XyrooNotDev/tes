@@ -76,9 +76,6 @@ jobs:
           channel: stable
           cache: true
 
-      # =============================================================
-      # MIRROR — tambal Maven Central + Google Maven untuk semua subproject
-      # =============================================================
       - name: Install Gradle Maven mirror (anti 429, includes Google Maven)
         shell: bash
         run: |
@@ -86,18 +83,12 @@ jobs:
           cat > "$HOME/.gradle/init.d/00-santanic-mirror.gradle" <<'GRADLE_EOF'
           // ============================================================
           // Santanic Gradle Mirror Init Script
-          // - Tambal Maven Central AND Google Maven (androidx, flutter_embedding)
-          // - Inject ke SETIAP subproject (plugin Flutter punya repo sendiri)
-          // - Mode PREFER_PROJECT agar plugin tidak "menolak" mirror settings
           // ============================================================
 
           def mirrors = [
-              // ---- Google Maven (WAJIB: flutter_embedding, androidx.*) ----
               'https://dl.google.com/dl/android/maven2/',
               'https://maven.google.com/',
               'https://maven.aliyun.com/repository/google',
-
-              // ---- Maven Central mirror ----
               'https://maven-central.storage-download.googleapis.com/maven2/',
               'https://maven.aliyun.com/repository/central',
               'https://maven.aliyun.com/repository/gradle-plugin',
@@ -105,8 +96,6 @@ jobs:
           ]
 
           beforeSettings { settings ->
-              // PREFER_PROJECT: plugin pihak ketiga punya repo sendiri di build.gradle.
-              // Kalau PREFER_SETTINGS, repo plugin DIABAIKAN -> dependency hilang.
               try {
                   settings.dependencyResolutionManagement.repositoriesMode.set(
                       org.gradle.api.initialization.resolve.RepositoriesMode.PREFER_PROJECT
@@ -130,7 +119,6 @@ jobs:
               }
           }
 
-          // Inject mirror ke SETIAP subproject (kunci fix flutter_embedding_release)
           beforeProject { proj ->
               try {
                   proj.repositories { repos ->
@@ -297,74 +285,74 @@ jobs:
           ./gradlew assembleRelease --stacktrace
 
       - name: Print & verify SHA fingerprint
-  id: fp
-  shell: bash
-  env:
-    EXPECTED_SHA256: ${{ secrets.EXPECTED_SHA256 }}
-  run: |
-    echo "=================================================="
-    echo "     SIGNING KEY FINGERPRINT"
-    echo "=================================================="
-    if [ -n "$KEYSTORE_PATH" ]; then
-      keytool -list -v -keystore "$KEYSTORE_PATH" \
-        -alias "${{ secrets.KEY_ALIAS }}" \
-        -storepass "${{ secrets.KEYSTORE_PASSWORD }}" | tee /tmp/fingerprint.txt
-      SHA1=$(grep "SHA1:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA1: //' | tr -d ' ')
-      SHA256=$(grep "SHA256:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA256: //' | tr -d ' ')
-      SOURCE="release-keystore"
-    else
-      echo "::warning::Menggunakan Debug Keystore (SHA tidak persisten)."
-      DEBUG_KEYSTORE="$HOME/.android/debug.keystore"
-      if [ ! -f "$DEBUG_KEYSTORE" ]; then
-        echo "Debug keystore belum ada, membuat baru..."
-        mkdir -p "$HOME/.android"
-        keytool -genkeypair -v \
-          -keystore "$DEBUG_KEYSTORE" \
-          -storetype JKS \
-          -keyalg RSA \
-          -keysize 2048 \
-          -validity 10000 \
-          -alias androiddebugkey \
-          -storepass android \
-          -keypass android \
-          -dname "CN=Android Debug,O=Android,C=US"
-      fi
-      keytool -list -v -keystore "$DEBUG_KEYSTORE" \
-        -alias androiddebugkey -storepass android -keypass android | tee /tmp/fingerprint.txt
-      SHA1=$(grep "SHA1:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA1: //' | tr -d ' ')
-      SHA256=$(grep "SHA256:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA256: //' | tr -d ' ')
-      SOURCE="debug-keystore"
-    fi
+        id: fp
+        shell: bash
+        env:
+          EXPECTED_SHA256: ${{ secrets.EXPECTED_SHA256 }}
+        run: |
+          echo "=================================================="
+          echo "     SIGNING KEY FINGERPRINT"
+          echo "=================================================="
+          if [ -n "$KEYSTORE_PATH" ]; then
+            keytool -list -v -keystore "$KEYSTORE_PATH" \
+              -alias "${{ secrets.KEY_ALIAS }}" \
+              -storepass "${{ secrets.KEYSTORE_PASSWORD }}" | tee /tmp/fingerprint.txt
+            SHA1=$(grep "SHA1:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA1: //' | tr -d ' ')
+            SHA256=$(grep "SHA256:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA256: //' | tr -d ' ')
+            SOURCE="release-keystore"
+          else
+            echo "::warning::Menggunakan Debug Keystore (SHA tidak persisten)."
+            DEBUG_KEYSTORE="$HOME/.android/debug.keystore"
+            if [ ! -f "$DEBUG_KEYSTORE" ]; then
+              echo "Debug keystore belum ada, membuat baru..."
+              mkdir -p "$HOME/.android"
+              keytool -genkeypair -v \
+                -keystore "$DEBUG_KEYSTORE" \
+                -storetype JKS \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -alias androiddebugkey \
+                -storepass android \
+                -keypass android \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+            keytool -list -v -keystore "$DEBUG_KEYSTORE" \
+              -alias androiddebugkey -storepass android -keypass android | tee /tmp/fingerprint.txt
+            SHA1=$(grep "SHA1:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA1: //' | tr -d ' ')
+            SHA256=$(grep "SHA256:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA256: //' | tr -d ' ')
+            SOURCE="debug-keystore"
+          fi
 
-    echo "::notice title=SHA-1::$SHA1"
-    echo "::notice title=SHA-256::$SHA256"
-    echo "::notice title=Source::$SOURCE"
+          echo "::notice title=SHA-1::$SHA1"
+          echo "::notice title=SHA-256::$SHA256"
+          echo "::notice title=Source::$SOURCE"
 
-    if [ -n "$EXPECTED_SHA256" ]; then
-      EXPECTED_NORM=$(echo "$EXPECTED_SHA256" | tr '[:lower:]' '[:upper:]' | tr -d ':')
-      ACTUAL_NORM=$(echo "$SHA256" | tr '[:lower:]' '[:upper:]' | tr -d ':')
-      if [ "$EXPECTED_NORM" != "$ACTUAL_NORM" ]; then
-        echo "::error::SHA-256 TIDAK COCOK!"
-        echo "   Expected : $EXPECTED_SHA256"
-        echo "   Actual   : $SHA256"
-        echo "   Sumber   : $SOURCE"
-        exit 1
-      fi
-      echo "✅ SHA-256 cocok dengan EXPECTED_SHA256 secret."
-    else
-      echo "::warning::EXPECTED_SHA256 tidak diisi — verifikasi dilewati."
-    fi
+          if [ -n "$EXPECTED_SHA256" ]; then
+            EXPECTED_NORM=$(echo "$EXPECTED_SHA256" | tr '[:lower:]' '[:upper:]' | tr -d ':')
+            ACTUAL_NORM=$(echo "$SHA256" | tr '[:lower:]' '[:upper:]' | tr -d ':')
+            if [ "$EXPECTED_NORM" != "$ACTUAL_NORM" ]; then
+              echo "::error::SHA-256 TIDAK COCOK!"
+              echo "   Expected : $EXPECTED_SHA256"
+              echo "   Actual   : $SHA256"
+              echo "   Sumber   : $SOURCE"
+              exit 1
+            fi
+            echo "✅ SHA-256 cocok dengan EXPECTED_SHA256 secret."
+          else
+            echo "::warning::EXPECTED_SHA256 tidak diisi — verifikasi dilewati."
+          fi
 
-    echo "SHA1=$SHA1" >> "$GITHUB_ENV"
-    echo "SHA256=$SHA256" >> "$GITHUB_ENV"
-    echo "FP_SOURCE=$SOURCE" >> "$GITHUB_ENV"
+          echo "SHA1=$SHA1" >> "$GITHUB_ENV"
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
+          echo "FP_SOURCE=$SOURCE" >> "$GITHUB_ENV"
 
-    mkdir -p santanic-output
-    {
-      echo "source=$SOURCE"
-      echo "sha1=$SHA1"
-      echo "sha256=$SHA256"
-    } > santanic-output/fingerprint.txt
+          mkdir -p santanic-output
+          {
+            echo "source=$SOURCE"
+            echo "sha1=$SHA1"
+            echo "sha256=$SHA256"
+          } > santanic-output/fingerprint.txt
 
       - name: Commit fingerprint to repo (permanen)
         if: env.KEYSTORE_PATH != '' && env.SHA256 != ''
